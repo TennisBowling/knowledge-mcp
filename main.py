@@ -96,7 +96,7 @@ async def handle_get_prompt(
 
         elif name == "search-entity":
             async with client.post("http://enzopc:8000/search_entity", json=arguments) as resp:
-                return [types.TextContent(type="text", text=await resp.json())]
+                return [types.TextContent(type="text", text=await resp.text())]
         
         else:
             return [types.TextContent(type="text", text="Could not find tool requested.")]
