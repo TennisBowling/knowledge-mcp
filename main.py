@@ -5,14 +5,12 @@ import mcp.server.stdio
 import mcp.types as types
 import asyncpg
 import json
+import aiohttp
 
-server = Server("example-server")
+server = Server("knowledge-graph")
 
-print("loading model")
-model_name = 'Snowflake/snowflake-arctic-embed-l-v2.0'
-model = SentenceTransformer(model_name)
-print("loaded model")
-db: asyncpg.Pool = None # type: ignore
+client = None
+
 
 # Add prompt capabilities
 @server.list_tools()
@@ -83,94 +81,34 @@ async def handle_get_prompt(
     name: str,
     arguments: dict[str, str]
 ) -> list[types.TextContent]:
-    global db
-    if name == "set-entity":            
-        name = arguments["name"]
-        entity_type = arguments["entity_type"]
-        new_content = arguments["content"]
+    global client
+    try:
+        if name == "set-entity":            
 
-        # First try to get existing content
-        existing_content = await db.fetchval("SELECT content FROM entities WHERE name = $1;", name)
+            # arguments is the same as what the server will try to decode
+            async with client.post("http://enzopc:8000/set_entity", json=arguments) as resp:
+                return [types.TextContent(type="text", text=(await resp.json())["message"])]
+            
 
-        if existing_content:
-            updated_content = existing_content + new_content
-            
-            # Create embedding based on old + new content
-            combined = json.dumps({"name": name, "entity_type": entity_type, "content": updated_content})
-            embedding = str(model.encode(combined).tolist())
-            
-            id = await db.fetchval("UPDATE entities SET content = $1, embedding = $2 WHERE name = $3 RETURNING id;", updated_content, embedding, name)
-            return [types.TextContent(type="text", text=f"Updated existing entity '{id}' with new content.")]
+        elif name == "set-relationship":
+            async with client.post("http://enzopc:8000/set_relationship", json=arguments) as resp:
+                return [types.TextContent(type="text", text=(await resp.json())["message"])]
+
+        elif name == "search-entity":
+            async with client.post("http://enzopc:8000/search_entity", json=arguments) as resp:
+                return [types.TextContent(type="text", text=await resp.json())]
+        
         else:
-            # Create new entry with just the new content
-            combined = json.dumps({"name": name, "entity_type": entity_type, "content": new_content})
-            embedding = str(model.encode(combined).tolist())
-            
-            id = await db.fetchval("INSERT INTO entities (name, type, content, embedding) VALUES ($1, $2, $3, $4) RETURNING id;", name, entity_type, new_content, embedding)
-            return [types.TextContent(type="text", text=f"Inserted new entity as id {id} into memory.")]
-        
-
-    elif name == "set-relationship":
-        entity1 = arguments["source_entity_id"]
-        entity2 = arguments["target_entity_id"]
-        relation_type = arguments["relation_type"]
-
-        await db.execute("INSERT INTO relations (source_entity_id, target_entity_id, relation_type) VALUES ($1, $2, $3);", entity1, entity2, relation_type)
-
-        return [types.TextContent(type="text", text=f"Created relationship.")]
-
-    elif name == "search-entity":
-        query = arguments["query"]
-        embedding = str(model.encode(query).tolist())
-        
-        # First get the initial matches
-        rows = await db.fetch(f"""
-            WITH initial_matches AS (
-                SELECT id, name, type, content 
-                FROM entities
-                WHERE embedding <=> '{embedding}' < 1.2
-                ORDER BY embedding <=> '{embedding}' 
-                LIMIT 3
-            ),
-            related_entities AS (
-                -- Get entities connected by outgoing relations
-                SELECT DISTINCT e.id, e.name, e.type, e.content
-                FROM initial_matches im
-                JOIN relations r ON im.id = r.source_entity_id
-                JOIN entities e ON r.target_entity_id = e.id
-                UNION
-                -- Get entities connected by incoming relations
-                SELECT DISTINCT e.id, e.name, e.type, e.content
-                FROM initial_matches im
-                JOIN relations r ON im.id = r.target_entity_id
-                JOIN entities e ON r.source_entity_id = e.id
-            )
-            SELECT id, name, type, content
-            FROM (
-                SELECT * FROM initial_matches
-                UNION
-                SELECT * FROM related_entities
-            ) combined;
-        """)
-
-        if not rows:
-            return [types.TextContent(type="text", text="No matches found.")]
-
-        ret = []
-        for row in rows:
-            ret.append({"id": row["id"], "name": row["name"], "type": row["type"], "content": row["content"]})
-
-        return [types.TextContent(type="text", text=str(ret))]
-
-    else:
-        return [types.TextContent(type="text", text="Something went wrong")]
+            return [types.TextContent(type="text", text="Could not find tool requested.")]
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"An error occurred: {e}")]
     
 
 
 async def run():
-    global db
-    db = await asyncpg.create_pool(database="tennisbowling", user="tennisbowling", host="mediacenter2", password="tennispass")
-
+    global client
+    client = aiohttp.ClientSession()
+    
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
